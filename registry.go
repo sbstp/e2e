@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"sync"
 )
 
@@ -46,7 +47,34 @@ func withPrintLock(f func()) {
 	f()
 }
 
-func runTest(job *testEntry) (result *testResult) {
+// testRun contains all the information needed to run the test suite, including information to synchronize
+// workers and cancel currently running tests.
+type testRun struct {
+	// Mutex to protect internal data structures.
+	mu *sync.Mutex
+	// Number of workers.
+	workers int
+	// Job queue, a channel with test entries in it to distribute work to workers.
+	jobQueue chan *testEntry
+	// Wait group to wait for all workers to be finished.
+	workersWG *sync.WaitGroup
+	// Store cancel functions of running tests, allowing to terminate executing tests.
+	cancelFuncs map[int]context.CancelFunc
+}
+
+func (t *testRun) setCancelFunc(runnerID int, cancel context.CancelFunc) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cancelFuncs[runnerID] = cancel
+}
+
+func (t *testRun) deleteCancelFunc(runnerID int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.cancelFuncs, runnerID)
+}
+
+func (t *testRun) runTest(runnerID int, job *testEntry) (result *testResult) {
 	result = &testResult{
 		failure: nil,
 		log:     &Logger{},
@@ -58,17 +86,29 @@ func runTest(job *testEntry) (result *testResult) {
 		}
 	}()
 
-	job.f(context.TODO(), result.log)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Store the cancel function in the testRun to that the context can be cancelled if the process is terminated.
+	t.setCancelFunc(runnerID, cancel)
+
+	// Run the test
+	job.f(ctx, result.log)
+
+	// Remove the cancel function from the testRun.
+	t.deleteCancelFunc(runnerID)
+
 	return
 }
 
-func startRunner(runnerID int, runnerName string, jobs chan *testEntry, wg *sync.WaitGroup) {
-	for job := range jobs {
+func (t *testRun) startRunner(runnerID int, runnerName string) {
+	t.workersWG.Add(1)
+
+	for job := range t.jobQueue {
 		withPrintLock(func() {
 			fmt.Printf("%s: starting test '%s'\n", runnerName, job.name)
 		})
 
-		job.result = runTest(job)
+		job.result = t.runTest(runnerID, job)
 
 		withPrintLock(func() {
 			if job.result.failure != nil {
@@ -81,7 +121,40 @@ func startRunner(runnerID int, runnerName string, jobs chan *testEntry, wg *sync
 			}
 		})
 	}
-	wg.Done()
+
+	t.workersWG.Done()
+}
+
+func (t *testRun) dispatch() {
+	term := make(chan os.Signal)
+	signal.Notify(term, os.Kill, os.Interrupt)
+
+	for _, entry := range registry {
+		select {
+		case t.jobQueue <- entry:
+		case <-term:
+			// If the program is terminated, we return which will initiate a shutdown of running tests,
+			// and cancel the contexts of tests currently running.
+			fmt.Println("\nShutting down...")
+			return
+		}
+	}
+}
+
+func (t *testRun) shutdown() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Cancel context of any running test
+	for _, cancelFunc := range t.cancelFuncs {
+		cancelFunc()
+	}
+
+	close(t.jobQueue)
+}
+
+func (t *testRun) wait() {
+	t.workersWG.Wait()
 }
 
 // Run runs all the tests registered with the Register function using the given amount of workers.
@@ -90,24 +163,26 @@ func Run(workers int) {
 		panic("e2e: Run needs at least one worker")
 	}
 
-	jobs := make(chan *testEntry, 0)
-	wg := new(sync.WaitGroup)
-	wg.Add(workers)
+	t := &testRun{
+		mu:          new(sync.Mutex),
+		workers:     workers,
+		jobQueue:    make(chan *testEntry, 0),
+		workersWG:   new(sync.WaitGroup),
+		cancelFuncs: make(map[int]context.CancelFunc),
+	}
 
 	// Spawn workers
 	for i := 0; i < workers; i++ {
 		runnerID := i + 1
 		runnerName := fmt.Sprintf("W%d", runnerID)
 
-		go startRunner(runnerID, runnerName, jobs, wg)
+		go t.startRunner(runnerID, runnerName)
 	}
 
 	// Dispatch jobs and wait for workers to finish.
-	for _, entry := range registry {
-		jobs <- entry
-	}
-	close(jobs)
-	wg.Wait()
+	t.dispatch()
+	t.shutdown()
+	t.wait()
 
 	// Tally the results
 	total := len(registry)
